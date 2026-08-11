@@ -14,7 +14,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const [recoveryMode, setRecoveryMode] = useState(false);
   useEffect(() => {
     const supabase = createClient();
-    supabase.auth.getUser().then(({ data }) => { setSignedIn(Boolean(data.user)); setReady(true); });
+    const completeRecovery = async () => {
+      const code = new URLSearchParams(window.location.search).get("code");
+      if (code) {
+        const { error } = await supabase.auth.exchangeCodeForSession(code);
+        if (!error) { setRecoveryMode(true); window.history.replaceState({}, "", window.location.pathname); }
+      }
+      const { data } = await supabase.auth.getUser();
+      setSignedIn(Boolean(data.user)); setReady(true);
+    };
+    completeRecovery();
     const { data: listener } = supabase.auth.onAuthStateChange((event, session) => { if (event === "PASSWORD_RECOVERY") setRecoveryMode(true); setSignedIn(Boolean(session?.user)); });
     return () => listener.subscription.unsubscribe();
   }, []);
