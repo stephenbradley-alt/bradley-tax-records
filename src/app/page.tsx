@@ -10,6 +10,7 @@ type Property = { id: string | number; name: string; address: string; ownership:
 type Entry = { id: string | number; kind: "Rent" | "Expense" | "Interest" | "Pension" | "Other"; date: string; description: string; amount: number; ownership: Ownership; property?: string; category?: string; receipt?: boolean; review?: boolean };
 type TaxYear = { id: string; label: string; starts_on: string; ends_on: string };
 type StoredDocument = { id: string; transaction_id: string | null; tax_year_id: string | null; original_name: string; mime_type: string | null; storage_path: string; url?: string };
+type RecordArea = { id: string; name: string; record_scope: "household" | "personal" };
 
 const money = (amount: number) => new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(amount);
 const currentYear = "2025–26 (6 April 2025 – 5 April 2026)";
@@ -23,6 +24,7 @@ function TaxApp() {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
   const [householdId, setHouseholdId] = useState<string | null>(null);
+  const [recordAreas, setRecordAreas] = useState<RecordArea[]>([]);
   const [taxYearId, setTaxYearId] = useState<string | null>(null);
   const [taxYears, setTaxYears] = useState<TaxYear[]>([]);
   const [p1Name, setP1Name] = useState("Person 1");
@@ -44,10 +46,17 @@ function TaxApp() {
     const load = async () => {
       const supabase = createClient(); const { data: userData } = await supabase.auth.getUser();
       if (!userData.user) return;
-      const { data: membership, error: membershipError } = await supabase.from("household_members").select("household_id").eq("user_id", userData.user.id).maybeSingle();
-      if (membershipError || !membership) { setNotice(`Could not open your household: ${membershipError?.message ?? "no household access found"}`); return; }
-      setHouseholdId(membership.household_id);
-      const [{ data: dbProperties }, { data: years }, { data: taxpayers }] = await Promise.all([supabase.from("properties").select("*").eq("household_id", membership.household_id), supabase.from("tax_years").select("*").eq("household_id", membership.household_id).order("starts_on"), supabase.from("taxpayers").select("label, display_name").eq("household_id", membership.household_id)]);
+      const { data: memberships, error: membershipError } = await supabase.from("household_members").select("household_id").eq("user_id", userData.user.id);
+      if (membershipError || !memberships?.length) { setNotice(`Could not open your records: ${membershipError?.message ?? "no record access found"}`); return; }
+      const memberIds = memberships.map(member => member.household_id);
+      const { data: areas, error: areaError } = await supabase.from("households").select("id, name, record_scope").in("id", memberIds);
+      if (areaError || !areas?.length) { setNotice(`Could not open your record areas: ${areaError?.message ?? "none found"}`); return; }
+      const availableAreas = areas as RecordArea[];
+      setRecordAreas(availableAreas);
+      const storedAreaId = window.localStorage.getItem("bradley-tax-record-area");
+      const activeAreaId = householdId && memberIds.includes(householdId) ? householdId : availableAreas.find(area => area.id === storedAreaId)?.id ?? availableAreas[0].id;
+      if (activeAreaId !== householdId) { setHouseholdId(activeAreaId); return; }
+      const [{ data: dbProperties }, { data: years }, { data: taxpayers }] = await Promise.all([supabase.from("properties").select("*").eq("household_id", activeAreaId), supabase.from("tax_years").select("*").eq("household_id", activeAreaId).order("starts_on"), supabase.from("taxpayers").select("label, display_name").eq("household_id", activeAreaId)]);
       setP1Name(taxpayers?.find((person: any) => person.label === "person_1")?.display_name ?? "Person 1");
       setP2Name(taxpayers?.find((person: any) => person.label === "person_2")?.display_name ?? "Person 2");
       const loadedYears = (years ?? []) as TaxYear[]; setTaxYears(loadedYears);
@@ -56,13 +65,18 @@ function TaxApp() {
       setYear(`${selectedYear.label.slice(0, 4)}–${selectedYear.label.slice(5)} (6 April ${selectedYear.starts_on.slice(0,4)} – 5 April ${selectedYear.ends_on.slice(0,4)})`);
       const propertyList: Property[] = ((dbProperties ?? []) as any[]).map(p => ({ id:p.id, name:p.name, address:p.address ?? "", ownership:(p.ownership === "person_1" ? "Person 1" : p.ownership === "person_2" ? "Person 2" : "Joint") as Ownership, p1:Number(p.person_1_pct), p2:Number(p.person_2_pct), active:p.active }));
       setProperties(propertyList);
-      const [{ data: dbEntries }, { data: dbDocuments }] = await Promise.all([supabase.from("transactions").select("*").eq("tax_year_id", selectedYear.id).order("occurred_on", { ascending:false }), supabase.from("documents").select("*").eq("household_id", membership.household_id).eq("tax_year_id", selectedYear.id).order("created_at", { ascending:false })]);
+      const [{ data: dbEntries }, { data: dbDocuments }] = await Promise.all([supabase.from("transactions").select("*").eq("tax_year_id", selectedYear.id).order("occurred_on", { ascending:false }), supabase.from("documents").select("*").eq("household_id", activeAreaId).eq("tax_year_id", selectedYear.id).order("created_at", { ascending:false })]);
       const kindMap: Record<string, Entry["kind"]> = { rental_income:"Rent", property_expense:"Expense", bank_interest:"Interest", private_pension:"Pension", state_pension:"Pension", other_income:"Other" };
       setEntries(((dbEntries ?? []) as any[]).map(e => ({ id:e.id, kind:kindMap[e.kind] ?? "Other", date:e.occurred_on, description:e.description ?? "", amount:Number(e.gross_amount), ownership:(e.ownership === "person_1" ? "Person 1" : e.ownership === "person_2" ? "Person 2" : "Joint") as Ownership, property:propertyList.find(p=>p.id===e.property_id)?.name, category:e.expense_category, review:e.needs_review })));
       const documentsWithUrls = await Promise.all(((dbDocuments ?? []) as any[]).map(async document => { const { data: signed } = await supabase.storage.from("tax-documents").createSignedUrl(document.storage_path, 3600); return { ...document, url:signed?.signedUrl } as StoredDocument; }));
       setDocuments(documentsWithUrls);
     }; load();
-  }, []);
+  }, [householdId]);
+  const changeRecordArea = (id: string) => {
+    window.localStorage.setItem("bradley-tax-record-area", id);
+    setEntries([]); setDocuments([]); setProperties([]); setTaxYears([]); setTaxYearId(null);
+    setHouseholdId(id);
+  };
   const openEntry = (kind: Entry["kind"]) => { setEntryKind(kind); setShowForm("entry"); };
   const changeTaxYear = async (id: string) => { const selected = taxYears.find(item => item.id === id); if (!selected || !householdId) return; setTaxYearId(id); setYear(`${selected.label.slice(0, 4)}–${selected.label.slice(5)} (6 April ${selected.starts_on.slice(0,4)} – 5 April ${selected.ends_on.slice(0,4)})`); const supabase = createClient(); const [{ data }, { data: dbDocuments }] = await Promise.all([supabase.from("transactions").select("*").eq("tax_year_id", id).order("occurred_on", { ascending:false }), supabase.from("documents").select("*").eq("household_id", householdId).eq("tax_year_id", id).order("created_at", { ascending:false })]); const kindMap: Record<string, Entry["kind"]> = { rental_income:"Rent", property_expense:"Expense", bank_interest:"Interest", private_pension:"Pension", state_pension:"Pension", other_income:"Other" }; setEntries(((data ?? []) as any[]).map(e => ({ id:e.id, kind:kindMap[e.kind] ?? "Other", date:e.occurred_on, description:e.description ?? "", amount:Number(e.gross_amount), ownership:(e.ownership === "person_1" ? "Person 1" : e.ownership === "person_2" ? "Person 2" : "Joint") as Ownership, property:properties.find(p=>p.id===e.property_id)?.name, category:e.expense_category, review:e.needs_review }))); const documentsWithUrls = await Promise.all(((dbDocuments ?? []) as any[]).map(async document => { const { data: signed } = await supabase.storage.from("tax-documents").createSignedUrl(document.storage_path, 3600); return { ...document, url:signed?.signedUrl } as StoredDocument; })); setDocuments(documentsWithUrls); };
   const saveEntry = async (event: FormEvent<HTMLFormElement>) => {
@@ -95,9 +109,16 @@ function TaxApp() {
   const addFamilyUser = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const email = String(new FormData(event.currentTarget).get("email")); const { data, error } = await createClient().functions.invoke("invite-household-member", { body: { email } }); setNotice(error ? error.message : data?.message ?? `An invitation has been sent to ${email}.`); };
   const saveNames = async () => { if (!householdId) { setNotice("Your secure household is still loading. Please try again in a moment."); return; } const { error } = await createClient().from("taxpayers").upsert([{ household_id: householdId, label: "person_1", display_name: p1Name.trim() || "Person 1", sort_order: 1 }, { household_id: householdId, label: "person_2", display_name: p2Name.trim() || "Person 2", sort_order: 2 }], { onConflict: "household_id,label" }); setNotice(error ? `Could not save: ${error.message}` : "Names saved securely."); };
   const addTaxYear = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!householdId) return; const data = new FormData(event.currentTarget); const start = String(data.get("start")); const end = String(data.get("end")); const label = `${start.slice(0,4)}-${end.slice(2,4)}`; const { data: saved, error } = await createClient().from("tax_years").insert({ household_id:householdId, label, starts_on:start, ends_on:end }).select().single(); if(error) { setNotice(`Could not add tax year: ${error.message}`); return; } setTaxYears([...taxYears, saved]); setNotice(`${label} tax year added.`); event.currentTarget.reset(); };
+  const createPrivateRecordArea = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); const data = new FormData(event.currentTarget);
+    const { data: createdId, error } = await createClient().rpc("create_private_tax_records", { record_name: String(data.get("recordName")), first_taxpayer_name: String(data.get("taxpayerName")) });
+    if (error) { setNotice(`Could not create private records: ${error.message}`); return; }
+    setNotice("Your private tax records have been created. Nobody else in the family can access them.");
+    changeRecordArea(createdId as string);
+  };
   const deleteEntry = async (id: string | number) => { if (!window.confirm("Delete this record? This cannot be undone.")) return; const { error } = await createClient().from("transactions").delete().eq("id", id); if (error) { setNotice(`Could not delete: ${error.message}`); return; } setEntries(entries.filter(entry => entry.id !== id)); setNotice("Record deleted."); };
   return <main className={styles.app}>
-    <header className={styles.header}><div><p className={styles.eyebrow}>Private household tax record keeping</p><h1>Bradley Tax Records</h1></div><label className={styles.year}>Tax year<select value={taxYearId ?? ""} onChange={e => changeTaxYear(e.target.value)}>{taxYears.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></header>
+    <header className={styles.header}><div><p className={styles.eyebrow}>Private household tax record keeping</p><h1>Bradley Tax Records</h1></div><div className={styles.headerSelectors}><label className={styles.year}>Record area<select value={householdId ?? ""} onChange={e => changeRecordArea(e.target.value)}>{recordAreas.map(area => <option key={area.id} value={area.id}>{area.name}{area.record_scope === "personal" ? " (private)" : ""}</option>)}</select></label><label className={styles.year}>Tax year<select value={taxYearId ?? ""} onChange={e => changeTaxYear(e.target.value)}>{taxYears.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div></header>
     <nav className={styles.nav}>{["Dashboard", "Properties", "Income", "Expenses", "Receipts", "Tax Summary", "Documents", "Settings"].map(item => <button className={tab === item ? styles.active : ""} onClick={() => setTab(item)} key={item}>{item}</button>)}</nav>
     {notice && <div className={styles.notice}>{notice}<button onClick={() => setNotice("")}>Dismiss</button></div>}
     {tab === "Dashboard" && <>
@@ -111,6 +132,7 @@ function TaxApp() {
     {(tab === "Receipts" || tab === "Documents") && <DocumentsList documents={documents} />}
     {tab === "Tax Summary" && <><TaxSummary entries={entries} properties={properties} totals={totals} p1={p1Name} p2={p2Name} /><ReceiptAppendix documents={documents} /></>}
     {tab === "Settings" && <section className={styles.settings}><h2>Settings</h2><label>Person 1 name<input value={p1Name} onChange={event => setP1Name(event.target.value)} /></label><label>Person 2 name<input value={p2Name} onChange={event => setP2Name(event.target.value)} /></label><button className={styles.primary} onClick={saveNames}>Save names</button><h3>Add future tax year</h3><form onSubmit={addTaxYear}><label>Start date<input name="start" type="date" required /></label><label>End date<input name="end" type="date" required /></label><button className={styles.primary}>Add tax year</button></form><h3>Add an authorised family user</h3><p>Enter their email address and the app will send them a secure invitation to set their own password. Nobody can create an account from the public sign-in page.</p><form onSubmit={addFamilyUser}><label>Email address<input name="email" type="email" required /></label><button className={styles.primary}>Send invitation</button></form><h3>HMRC mapping – 2025–26</h3><p>These labels and box numbers are kept separate from your financial records. Check and update them when HMRC releases a new year’s return.</p><div className={styles.mapping}><span>SA105 box 20</span><b>Total rents and other income</b><span>SA105 box 24</span><b>Rent, rates, insurance and ground rents</b><span>SA105 box 25</span><b>Property repairs and maintenance</b></div></section>}
+    {tab === "Settings" && !recordAreas.some(area => area.record_scope === "personal") && <section className={styles.settings}><h3>Create your own private tax records</h3><p>This creates a completely separate record area for you. Your parents will not be able to see or open it.</p><form onSubmit={createPrivateRecordArea}><label>Name for this record area<input name="recordName" defaultValue="My Tax Records" required /></label><label>Your name<input name="taxpayerName" defaultValue="Stephen Bradley" required /></label><button className={styles.primary}>Create my private records</button></form></section>}
     {showForm === "entry" && <EntryForm kind={entryKind} properties={properties} p1Name={p1Name} p2Name={p2Name} onSave={saveEntry} onCancel={() => setShowForm(null)} />}
     {showForm === "property" && <PropertyForm p1Name={p1Name} p2Name={p2Name} initial={editingProperty} onSave={saveProperty} onCancel={() => { setEditingProperty(null); setShowForm(null); }} />}
   </main>;
